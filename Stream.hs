@@ -11,6 +11,7 @@ module Stream
   , broadcast_
   , broadcast
   , receive
+  , multicast_
   , multicast
   , interval
   , interval'
@@ -22,6 +23,7 @@ module Stream
   , speedS
   , requestS
   , takeS
+  , takeS_
   , foreverS
   , stopS
   , zipS
@@ -29,8 +31,9 @@ module Stream
   , zipWithIndex
   , controlS
   , mergeS
-  , Time (..)
+  , DTime (..)
   , fetchS
+  , concatS
   ) where
 
 import Control.Monad (join)
@@ -42,7 +45,7 @@ import Control.Monad.IO.Class (MonadIO)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
 import Data.Maybe (fromJust)
 
-type Time = Int
+type DTime = Int
 
 data Stream a = Next (Maybe a) (AStream a)  
               | End (Maybe a)
@@ -85,6 +88,9 @@ switchS (a `Next` ms) mss = a `Next` (h ms =<< spawnM mss)
                              Right (a `Next` ms') -> a `Next` h ms' mss 
 switchS (End a) mss = a `Next` (joinS <$> mss)
           
+concatS :: Stream a -> Stream a -> Stream a
+concatS (End a) s = Next a $ pure s
+concatS (Next a m) s = Next a $ (`concatS` s) <$> m
 
 -----------------------------------------------------------------------
 
@@ -112,6 +118,10 @@ runS (Next a ms) k = do ifAliveM
 
 run :: Stream a -> (a -> IO ()) -> IO ()
 run s k = runM_ (runS s k) return 
+
+-- run s with k and the cancel s after it ends
+run_ :: Stream a -> (a -> IO ()) -> IO ()
+run_ s k = runM_ (runS s k >> cancelM) return 
 
 -- emit the first index after 1 ms delay
 interval :: Int -> Int -> Stream Int
@@ -209,13 +219,20 @@ justS (Next a ms) = Next a (ms >>= h)
 -- take the first n events. If n <= 0, then nothing
 -- if 's' has less than n events, the 'takeS n s' emits all events of s
 takeS :: Int -> Stream a -> Stream a
-takeS n s = if n <= 0 then End Nothing else f n (justS s)  
-  where f n (Next a ms) = Next a (scopeM $ h (n-1) ms)
+takeS n s = if n <= 0 then End Nothing else f n s
+  where f 1 (Next (Just x) _) = End (Just x)
+        f n (Next a ms) = Next a $ takeS (maybe n (\_->n-1) a) <$> ms
         f _ (End a) = End a
-        h 0 ms = cancelM >> return (End Nothing)
-        h n ms = do s <- ms
-                    case s of Next a ms' -> return $ Next a (h (n-1) ms')
-                              End a -> return (End a)
+
+-- explicitly cancel a stream after it reaches the 'End'
+endS (End a) = End a
+endS (Next a ms) = Next a $ scopeM $ f ms
+  where f m = do s <- m
+                 case s of End a -> cancelM >> return (End a) 
+                           Next a m' -> return $ Next a $ f m'
+
+-- take n events from s and cancel s explicitly
+takeS_ n s = endS $ takeS n s
 
 -- drop the first n events
 -- if 's' has less than n events, then 'dropS s' never starts.
@@ -226,22 +243,22 @@ dropS n s = justS (h n s)
                                       Next _ ms -> Next Nothing (h (n-1) <$> ms)
 
 -- wait dt milliseconds and then start 's'
-waitS :: Time -> Stream a -> Stream a
+waitS :: DTime -> Stream a -> Stream a
 waitS dt s = Next Nothing (timeout dt >> return s)
 
 -- skip the events of the first dt milliseconds  
-skipS :: Time -> Stream a -> Stream a
+skipS :: DTime -> Stream a -> Stream a
 skipS dt s = do s' <- multicast s 
                 waitS dt s'
 
 -- delay each event of 's' by dt milliseconds
-delayS :: Time -> Stream a -> Stream a
+delayS :: DTime -> Stream a -> Stream a
 delayS dt s = Next Nothing (h s)
   where h (Next a ms) = timeout dt >> (return $ Next a (ms >>= h))
         h (End a) = timeout dt >> (return $ End a)
 
 -- stop 's' after dt milliseconds
-stopS :: Time -> Stream a -> Stream a
+stopS :: DTime -> Stream a -> Stream a
 -- stopS dt s = s `untilS` (timeout dt >> return (End Nothing))
 stopS _ (End a) = End a
 stopS dt s = s `switchS` (timeout dt >> return (End Nothing))
@@ -263,11 +280,11 @@ lastS s m = spawnM m >>= flip h s
         h m (End a) = m >> return a
 
 -- fold the functions emitted from s for n milli-second with the initial value c 
-foldS :: Time -> a -> Stream (a -> a) -> AsyncM a
+foldS :: DTime -> a -> Stream (a -> a) -> AsyncM a
 foldS n c s = fromJust <$> lastS (accumulate c s) (timeout n) 
 
 -- emit the number of events of s for every n milli-second
-countS :: Time -> Stream b -> AsyncM Int
+countS :: DTime -> Stream b -> AsyncM Int
 countS n s = foldS n 0 $ (+1) <$ s 
 
 -- run s until ms occurs and then runs the stream in ms
@@ -283,12 +300,12 @@ fetchS sm = Next Nothing $ do c <- liftIO newChan
                               repeatA $ join $ liftIO (readChan c) 
 
 -- measure the data speed = total sample time / system time
-speedS :: Time -> Stream (Time, a) -> AsyncM Float
+speedS :: DTime -> Stream (DTime, a) -> AsyncM Float
 speedS n s = f <$> (foldS n 0 $ (\(dt,_) t -> t + dt) <$> s)
   where f t = fromIntegral t / fromIntegral n
 
 -- call f to request samples with 'dt' interval and 'delay' between requests
-requestS :: (Time -> AsyncM a) -> Time -> Time -> Stream (Time, a)
+requestS :: (DTime -> AsyncM a) -> DTime -> DTime -> Stream (DTime, a)
 requestS f dt delay = (,) dt <$> s
   where s = fetchS $ f dt <$ foreverS delay
 
