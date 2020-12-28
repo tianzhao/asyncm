@@ -6,69 +6,87 @@
 type Unit = void;
 const unit: Unit = undefined;
 
+type Func<A,B> = (a: A) => B;
+type Time = number;
+
+type MaybeAppResult<T, A> = T extends Func<A, infer B> ? Maybe<B> : never;
+
+type AsyncMAppResult<T, A> = T extends Func<A, infer B> ? AsyncM<B> : never;
+type AsyncMJoinResult<T> = T extends AsyncM<infer R> ? AsyncM<R> : never;
+
+type StreamAppResult<T, A> = T extends Func<A, infer B> ? Stream<B> : never;
+type StreamJoinResult<T> = T extends Stream<infer R> ? Stream<R> : never;
+
+
+function isFunction<A,B>(f: any): f is Func<A,B> {
+	return typeof f === "function";
+}
+
+function ensureIsAsyncM<A>(m: unknown): AsyncM<A> {
+	if (m instanceof AsyncM)
+		return m;
+	throw new TypeError();
+}
+
+function ensureIsStream<A>(m: unknown): Stream<A> {
+	if (m instanceof Stream)
+		throw m;
+	throw new TypeError();
+}
+
 /*
  * Maybe type
  */
 
-abstract class Maybe<A> {
-	abstract maybe<B>(def: B): (f: (a: A) => B) => B;
-	abstract fmap<B>(f: (a: A) => B): Maybe<B>;
-	abstract app<T,R>(mx: Maybe<T>): Maybe<R>;
-	abstract fromJust(): A;
+abstract class Maybe<T> {
+	abstract maybe<B>(def: B): (f: (a: T) => B) => B;
+	abstract fromJust(): T;
+	abstract isNothing(): boolean;
+
+	abstract fmap<B>(f: (a: T) => B): Maybe<B>;
+	abstract app<A>(mx: Maybe<A>): MaybeAppResult<T,A>;
 
 	static nothing: Nothing<any>;
 	static just<T>(val: T) { return new Just<T>(val); }
-	static pair = <T1,T2>(a: Maybe<T1>) => (b: Maybe<T2>): Maybe<[T1,T2]> => a.fmap(x => y => [x, y]).app(b);
+	static pair = <T1>(a: Maybe<T1>) => <T2>(b: Maybe<T2>): Maybe<[T1,T2]> => a.fmap(x => (y: T2): [T1,T2] => [x, y]).app(b);
 }
 
-
-class Nothing<A> extends Maybe<A> {
+class Nothing<T> extends Maybe<T> {
 	maybe<B>(def: B) { return () => def; }
-	fromJust(): A { throw new Error(); }
-	fmap<B>(f: (a: A) => B): Nothing<B> { return this as any; }
-	app<T,R>(_: any): Maybe<R> { return this as any; }
+	fromJust(): never { throw new TypeError(); }
+	isNothing(): boolean { return true; }
+
+	fmap<B>(f: (a: T) => B): Nothing<B> { return this as any; }
+	app<A>(_: Maybe<A>): MaybeAppResult<T,A> { return this as any; }
 }
 
 Maybe.nothing = new Nothing<any>();
 
-function isFunction<A,B>(f: any): f is ((a: A) => B) {
-	return typeof f === "function";
-}
 
-class Just<A> extends Maybe<A> {
-	value: A;
+class Just<T> extends Maybe<T> {
+	value: T;
 
-	constructor(value: A) {
+	constructor(value: T) {
 		super();
 		this.value = value;
 	}
 
 	maybe<B>(_: B) {
-		return (f: (a: A) => B) => f(this.value);
+		return (f: (a: T) => B) => f(this.value);
 	}
 
-	fromJust(): A { return this.value; }
+	fromJust(): T { return this.value; }
+	isNothing(): boolean { return false; }
 
-	fmap<B>(f: (a: A) => B) { return new Just(f(this.value)); }
+	fmap<B>(f: (a: T) => B): Just<B> { return new Just(f(this.value)); }
 
-	//FIXME
-	app<B,C>(maybeX: Maybe<B>): Maybe<C> {
-	//app<B,C>(maybeX: Maybe<B>): A extends (b: B) => C ? Maybe<C> : never {
-		if (!isFunction<B,C>(this.value))
-			throw new Error();
-		return maybeX.fmap(this.value);
+	app<A,B>(maybeX: Maybe<A>): MaybeAppResult<T,A> {
+		if (!isFunction<A,B>(this.value))
+			throw new TypeError();
+		return maybeX.fmap<B>(this.value) as any;
 	}
 }
 
-
-
-/*
-const Maybe = { 
-	nothing : new Nothing (), 
-	just : x => new Just (x), 
-	pair : a => b => new Just (x=>y=>[x,y]).app(a).app(b) 
-};
-*/
 
 /*
  * Either type
@@ -101,7 +119,7 @@ class Right<A, B> extends Either<A, B> {
 		this.value = value;
 	}
 
-	either() { return r => r(this.value); }
+	either<C>(l: Func<A,C>): (r: Func<B,C>) => C { return r => r(this.value); }
 }
 
 
@@ -134,7 +152,7 @@ abstract class Progress {
 class ConsP extends Progress {
 	tail: Progress;
 
-	constructor(tail) {
+	constructor(tail: Progress) {
 		super();
 		this.tail = tail;
 	}
@@ -147,10 +165,10 @@ class NilP extends Progress {
 	isAliveP() { return !this.head; }
 }
 
-type Func<A,B> = (a: A) => B;
 /*
  *  3. AsyncM definitions: AsyncM, never, timeout, cancel, ifAlive, commit, race, any, all 
  */
+
 
 class AsyncM<T> {
 	run: (p: Progress) => Promise<T>;
@@ -170,15 +188,18 @@ class AsyncM<T> {
 	// this >>= f
 	bind<R>(f: (a: T) => AsyncM<R>): AsyncM<R> { return new AsyncM(p => this.run(p).then(x => f(x).run(p))); }
 
-	// FIXME
 	// flatten an AsyncM of AsyncM
-	join<R>(): AsyncM<R> { return this.bind(m => m as any); }
+	join(): AsyncMJoinResult<T> {
+		return this.bind(m => ensureIsAsyncM(m)) as any;
+	}
 
-	// FIXME
 	// this <*> mx
-	app<A, B>(mx: AsyncM<A>): AsyncM<B> {
-		let mf = this as unknown as AsyncM<(a: A) => B>;
-		return mf.bind(f => mx.bind(x => AsyncM.pure(f(x))));
+	app<A>(mx: AsyncM<A>): AsyncMAppResult<T, A> {
+		return this.bind(f => {
+			if (isFunction(f))
+				return mx.bind(x => AsyncM.pure(f(x)));
+			throw new TypeError();
+		}) as any;
 	}
 
 	// return an AsyncM of AsyncM to wait for the result of 'this'
@@ -237,15 +258,15 @@ class AsyncM<T> {
 	static timeout(n: number): AsyncM<void> { return new AsyncM(_ => new Promise(k => setTimeout(k, n))); }
 
 	// cancel the current progress
-	static cancel: AsyncM<unknown> = new AsyncM(p => new Promise<void>(k => { if (p.cancelP()) k(); }));
+	static cancel: AsyncM<Unit> = new AsyncM(p => new Promise<void>(k => { if (p.cancelP()) k(); }));
 
 	// continues only if 'p' is still alive
 	//
 	// () => k() simulates the IO that k returns
-	static ifAlive = new AsyncM(p => new Promise<void>(k => { if (p.isAliveP()) k(); }));
+	static ifAlive: AsyncM<Unit> = new AsyncM(p => new Promise<void>(k => { if (p.isAliveP()) k(); }));
 
 	// if alive, then cancel
-	static commit = AsyncM.ifAlive.bind(_ => AsyncM.cancel);
+	static commit: AsyncM<Unit> = AsyncM.ifAlive.bind(_ => AsyncM.cancel);
 
 	// run two AsyncM with a new progress
 	static race = <A>(m1: AsyncM<A>) => (m2: AsyncM<A>): AsyncM<A> =>
@@ -261,11 +282,12 @@ class AsyncM<T> {
 			(m2.bind(x2 => AsyncM.commit.bind(_ => AsyncM.pure(Either.right<A,B>(x2)))))
 
 	// run two AsyncM and wait for both of their results
-	static all = <A>(m1: AsyncM<A>) => (m2: AsyncM<A>): AsyncM<[A, A]> => new AsyncM<[A, A]>(p => Promise.all([m1.run(p), m2.run(p)]));
+	static all = <A>(m1: AsyncM<A>) => (m2: AsyncM<A>): AsyncM<[A, A]> =>
+		new AsyncM<[A, A]>(p => Promise.all([m1.run(p), m2.run(p)]));
 
 	/*
-	   * for testing purpose only 
-	   */
+	 * for testing purpose only 
+	 */
 	static interval<A>(n: number, dt: number, f: (a: number) => A): AsyncM<A> {
 		const h = i => AsyncM.ifAlive.bind(_ => new AsyncM(async p => {
 			if (i <= n) {
@@ -288,7 +310,6 @@ class SpawnM<A> extends AsyncM<A> { spawn(): SpawnM<AsyncM<A>> { return this as 
 /*
  *  4. Emitter definition
  */
-
 class Emitter<T> {
 	now: T;
 	listeners: Array<(a: any) => void>;
@@ -403,9 +424,12 @@ abstract class Stream<T> {
 	}
 
 	// this <*> sx
-	app<A,B>(sx: Stream<A>): Stream<B> {
-		let mf = this as unknown as Stream<(a: A) => B>;
-		return mf.bind(f => sx.bind(x => Stream.pure(f(x))));
+	app<A>(sx: Stream<A>): StreamAppResult<T,A> {
+		return this.bind(f => {
+			if (isFunction(f))
+				return sx.bind(x => Stream.pure(f(x)));
+			throw new TypeError();
+		}) as any;
 	}
 
 	// s >>= f
@@ -415,13 +439,13 @@ abstract class Stream<T> {
 			(_ => this.fmap(k).join());
 	}
 
-	//FIXME
 	// flatten a stream of streams
-	join<R>(): Stream<R> {
-		let thism = this as unknown as Stream<Stream<R>>;
-		return thism.match
-			(a => a.maybe(thism as any)(s => s))
-			((a, m) => a.maybe(Stream.next(Maybe.nothing, m.fmap(ss => ss.join())))(s => s.switchS(m)));
+	join(): StreamJoinResult<T> {
+		let thism = this as any as Stream<Stream<T>>;
+		let ret: Stream<unknown> = thism.match
+			(a => a.maybe(thism as any)(s => ensureIsStream(s)))
+			((a, m) => a.maybe(Stream.next(Maybe.nothing, m.fmap(ss => ss.join())))(s => ensureIsStream(s).switchS(m)))
+		return ret as any;
 	}
 
 	// switch 'this' stream on future stream of streams 'mss' -- usage: s.switchS(mss) 
@@ -439,12 +463,10 @@ abstract class Stream<T> {
 			((a, m) => Stream.next(a, mss.spawn().bind(mss1 => h(m)(mss1))))
 	}
 
-	//FIXME
 	// take a snapshot of the right stream 'sx' for each left stream event 'f' and return 'f x' as a stream
-	leftApp<A,B>(sx: Stream<A>): Stream<B> {
-		let thism = this as unknown as Stream<(a: A) => B>;
+	leftApp<A>(sx: Stream<A>): StreamAppResult<T,A> {
 		// run 's' until it emits the first 'Just' event 
-		const h = s => s.match
+		const h = (s: Stream<A>): Stream<A> => s.match
 			(_ => s)
 			((a, m) => a.maybe(Stream.next(Maybe.nothing, m.fmap(h)))(x => Stream.end(Maybe.just(x))));
 
@@ -529,7 +551,7 @@ abstract class Stream<T> {
 			? Stream.end(Maybe.nothing)
 			: this.match
 				(_ => this as Stream<T>)
-				((a, m) => (n <= 1 && a != Maybe.nothing)
+				((a, m) => (n <= 1 && a.isNothing())
 					? Stream.end(a)
 					: Stream.next(a, (this as unknown as Next<T>).next.fmap(s => s.take(a.maybe(n)(_ => n - 1)))))
 	}
@@ -619,13 +641,13 @@ abstract class Stream<T> {
 
 	//FIXME
 	// fold the functions of 'this' stream for 'n' milliseconds and return the final result
-	fold<A>(n: number): (c: A) => AsyncM<A> {
+	fold(n: number): <A>(c: A) => AsyncM<A> {
 		return c => this.accumulate(c).last(AsyncM.timeout(n)).fmap(r => r.fromJust());
 	}
 
 	// count the number of events in 'this' stream within 'n' milliseconds
-	count(n: number) {
-		return this.fmap(_ => c => c + 1).fold(n)(0);
+	count(n: number): AsyncM<number> {
+		return this.fmap(_ => (c: number) => c + 1).fold(n)(0);
 	}
 
 	// run 'this' stream until the future stream 'ms' emits its stream
@@ -642,7 +664,7 @@ abstract class Stream<T> {
 		const m: AsyncM<Stream<A>> = AsyncM.liftIO<Channel<AsyncM<A>>>(k => k(new Channel())).bind(c => {
 			const w = thism.bind(m => m.spawn().liftS()).run(m1 => c.write(m1)).fork();
 			// We don't use the progress 'p' here but do we need to cancel it later?
-			return w.bind(p => AsyncM.liftIO_(c.read()).join<A>().repeatA());
+			return w.bind(p => AsyncM.liftIO_(c.read()).join().repeatA());
 		});
 
 		return Stream.next(Maybe.nothing, m);
@@ -696,7 +718,7 @@ abstract class Stream<T> {
 	static pure = <A>(x: A): Stream<A> => Stream.end(Maybe.just(x));
 
 	// emits a number from 1 to n every 'dt' milliseconds 
-	static interval = (dt, n) => {
+	static interval = (dt: number, n: number): Stream<number> => {
 		const h = x => (x >= n) ? AsyncM.pure(Stream.end(Maybe.just(x))) :
 			AsyncM.ifAlive.bind(_ =>
 				AsyncM.pure(
@@ -707,13 +729,13 @@ abstract class Stream<T> {
 	}
 
 	// an indirect way to make an interval
-	static interval_ = (dt, n) => Stream.forever(dt).zipWithIndex(0).fmap(([i, _]) => i).take(n)
+	static interval_ = (dt: number, n: number): Stream<number> => Stream.forever(dt).zipWithIndex(0).fmap(([i, _]) => i).take(n);
 
 	// emit unit every 'dt' millisecond forever.
-	static forever = (dt: number): Stream<Unit> => AsyncM.timeout(dt).repeatS()
+	static forever = (dt: number): Stream<Unit> => AsyncM.timeout(dt).repeatS();
 
 	// return a finite stream with elements in 'lst' 
-	static fromList = (lst: any[]) => {
+	static fromList = <T>(lst: T[]): Stream<T> => {
 		if (lst.length == 0) { return Stream.end(Maybe.nothing); }
 		else {
 			let [a, ...b] = lst
@@ -724,16 +746,16 @@ abstract class Stream<T> {
 	// converts a stream of requests (of the sampling period 'dt' and latency 'delay') to a stream of (dt, a) pairs
 	//
 	// request :: (Time -> AsyncM a) -> Time -> Time -> Stream (Time, a)
-	static request = async_fun => dt => delay =>
-		Stream.forever(delay).fmap(_ => async_fun(dt)).fetch().fmap(x => [dt, x])
+	static request = <A>(async_fun: (time: number) => AsyncM<A>) => (dt: number) => (delay: number): Stream<[number, A]> =>
+		Stream.forever(delay).fmap(_ => async_fun(dt)).fetch<A>().fmap(x => [dt, x]);
 
 	// control the speed of a stream of requests by adjusting the sampling rate 'dt' using the 'adjust' function
 	//
 	// control :: (t -> Stream (AsyncM a)) -> Int -> t -> (Bool -> t -> t) -> Stream (t, a) 
-	static control = req_fun => duration => dt => adjust => {
+	static control = <A>(req_fun: (a: number) => Stream<AsyncM<A>>) => (duration: number) => (dt: number) => (adjust: (b: boolean) => (c: number) => number): Stream<[number, A]> => {
 		const h = dt =>
 			req_fun(dt).multicast_().bind(([request, p1]) =>
-				request.fetch().multicast_().bind(([response, p2]) => {
+				request.fetch<A>().multicast_().bind(([response, p2]) => {
 					const mss = AsyncM.timeout(duration).bind(_ =>
 						AsyncM.all(response.count(duration))(request.count(duration))
 							.bind(([x, y]) => {
@@ -747,7 +769,7 @@ abstract class Stream<T> {
 							})
 					);
 
-					return Stream.next(Maybe.just(response.fmap(x => [dt, x])), mss);
+					return Stream.next(Maybe.just(response.fmap(<R>(x:R): [number, R] => [dt, x])), mss);
 				}));
 
 		return h(dt).join();
@@ -1147,4 +1169,5 @@ const t26 = s2.skip(200)
 
 // The first 'run' returns an 'AsyncM' and the second 'run' executes the 'AsyncM'.
 t5.run(x => console.log(x)).run(Progress.nil());
+
 
