@@ -8,6 +8,7 @@ const unit: Unit = undefined;
 
 type Func<A,B> = (a: A) => B;
 type Time = number;
+type Duration = number;
 
 type MaybeAppResult<T, A> = T extends Func<A, infer B> ? Maybe<B> : never;
 
@@ -17,20 +18,33 @@ type AsyncMJoinResult<T> = T extends AsyncM<infer R> ? AsyncM<R> : never;
 type StreamAppResult<T, A> = T extends Func<A, infer B> ? Stream<B> : never;
 type StreamJoinResult<T> = T extends Stream<infer R> ? Stream<R> : never;
 
+type SignalAppResult<T, A> = T extends Func<A, infer B> ? Signal<B> : never;
+type BehaviorAppResult<T, A> = T extends Func<A, infer B> ? Behavior<B> : never;
+
+type Ease<T> = unknown extends T ? any : T;
+
 
 function isFunction<A,B>(f: any): f is Func<A,B> {
 	return typeof f === "function";
 }
 
-function ensureIsAsyncM<A>(m: unknown): AsyncM<A> {
-	if (m instanceof AsyncM)
-		return m;
+function ensureTuple<T,A,B>(t: T): T extends [A,B] ? [Ease<A>, Ease<B>] : never {
+	if (t instanceof Array) return t as any;
 	throw new TypeError();
 }
 
-function ensureIsStream<A>(m: unknown): Stream<A> {
-	if (m instanceof Stream)
-		throw m;
+function ensureFunction<A,B>(f: any): Func<A,B> {
+	if (f instanceof Function) return f;
+	throw new TypeError();
+}
+
+function ensureAsyncM<A>(m: unknown): AsyncM<A> {
+	if (m instanceof AsyncM) return m;
+	throw new TypeError();
+}
+
+function ensureStream<A>(m: unknown): Stream<A> {
+	if (m instanceof Stream) return m;
 	throw new TypeError();
 }
 
@@ -190,9 +204,10 @@ class AsyncM<T> {
 
 	// flatten an AsyncM of AsyncM
 	join(): AsyncMJoinResult<T> {
-		return this.bind(m => ensureIsAsyncM(m)) as any;
+		return this.bind(m => ensureAsyncM(m)) as any;
 	}
 
+	// return type is not accurate to the implementation: error doesn't occur until it's run
 	// this <*> mx
 	app<A>(mx: AsyncM<A>): AsyncMAppResult<T, A> {
 		return this.bind(f => {
@@ -226,7 +241,13 @@ class AsyncM<T> {
 	scope(): AsyncM<T> { return new AsyncM(p => this.run(p.cons())); }
 
 	// run 'this' under the parent progress
-	unscope(): AsyncM<T> { return new AsyncM((p: ConsP) => this.run(p.tail == undefined ? p : p.tail)); }
+	unscope(): AsyncM<T> {
+		return new AsyncM((p: Progress) => {
+			if (p instanceof ConsP)
+				return this.run(p.tail == undefined ? p : p.tail);
+			throw new Error();
+		});
+	}
 
 	// lift AsyncM to a stream
 	liftS(): Stream<T> { return Stream.next(Maybe.nothing, this.bind(x => AsyncM.pure(Stream.pure(x)))); }
@@ -255,7 +276,7 @@ class AsyncM<T> {
 	static never: AsyncM<never> = new AsyncM(p => new Promise(_ => { }));
 
 	// completes after 'n' millisecond timeout
-	static timeout(n: number): AsyncM<void> { return new AsyncM(_ => new Promise(k => setTimeout(k, n))); }
+	static timeout(n: Duration): AsyncM<void> { return new AsyncM(_ => new Promise(k => setTimeout(k, n))); }
 
 	// cancel the current progress
 	static cancel: AsyncM<Unit> = new AsyncM(p => new Promise<void>(k => { if (p.cancelP()) k(); }));
@@ -282,20 +303,22 @@ class AsyncM<T> {
 			(m2.bind(x2 => AsyncM.commit.bind(_ => AsyncM.pure(Either.right<A,B>(x2)))))
 
 	// run two AsyncM and wait for both of their results
-	static all = <A>(m1: AsyncM<A>) => (m2: AsyncM<A>): AsyncM<[A, A]> =>
-		new AsyncM<[A, A]>(p => Promise.all([m1.run(p), m2.run(p)]));
+	static all = <A>(m1: AsyncM<A>) => <B>(m2: AsyncM<B>): AsyncM<[A, B]> =>
+		new AsyncM(p => Promise.all([m1.run(p), m2.run(p)]));
 
 	/*
 	 * for testing purpose only 
 	 */
-	static interval<A>(n: number, dt: number, f: (a: number) => A): AsyncM<A> {
-		const h = i => AsyncM.ifAlive.bind(_ => new AsyncM(async p => {
-			if (i <= n) {
-				return AsyncM.timeout(dt)
-					.bind(_ => AsyncM.liftIO(k => k(f(i))).bind(_ => h(i + 1)))
-					.run(p);
-			}
-		}));
+	static interval<A>(n: number, dt: number, f: (a: number) => A): AsyncM<A | void> {
+		const h = (i: number): AsyncM<A | void> =>
+			AsyncM.ifAlive.bind(() =>
+				new AsyncM(async p => {
+					if (i <= n) {
+						return AsyncM.timeout(dt)
+							.bind(_ => AsyncM.liftIO(k => k(f(i))).bind(_ => h(i + 1)))
+							.run(p);
+					}
+				}));
 		return h(1);
 	}
 }
@@ -311,8 +334,8 @@ class SpawnM<A> extends AsyncM<A> { spawn(): SpawnM<AsyncM<A>> { return this as 
  *  4. Emitter definition
  */
 class Emitter<T> {
-	now: T;
-	listeners: Array<(a: any) => void>;
+	now: T | undefined;
+	listeners: Array<(a: T) => void>;
 
 	constructor() {
 		this.now = undefined;  // current event
@@ -331,7 +354,7 @@ class Emitter<T> {
 	}
 
 	// listen for the next event as an AsyncM
-	listen(): AsyncM<void> { return new AsyncM(p => new Promise(k => { this.listeners.push(k); })); }
+	listen(): AsyncM<T> { return new AsyncM(p => new Promise(k => { this.listeners.push(k); })); }
 
 	// return the current event or wait for the future one
 	wait(): AsyncM<T> {
@@ -346,7 +369,7 @@ class Emitter<T> {
 
 	// listen to the future events as a stream
 	receive(): Stream<T> {
-		const h = () => this.listen()
+		const h = (): AsyncM<Stream<T>> => this.listen()
 			.bind(a => AsyncM.ifAlive.bind(_ =>
 				AsyncM.pure(Stream.next(Maybe.just(a), h()))
 			));
@@ -374,7 +397,7 @@ class Channel<T> {
 		return new Promise(k => {
 			const d = this.data;
 			if (d.length > 0) {
-				k(d.shift()); 		// read one data
+				k(d.shift()!); 		// read one data
 			} else {
 				this.listeners.push(k); // add reader to the queue
 			}
@@ -385,7 +408,7 @@ class Channel<T> {
 	write(x: T): void {
 		const l = this.listeners;
 		if (l.length > 0) {
-			const k = l.shift(); 	// wake up one reader in FIFO order
+			const k = l.shift()!; 	// wake up one reader in FIFO order
 			k(x);
 		}
 		else {
@@ -443,14 +466,14 @@ abstract class Stream<T> {
 	join(): StreamJoinResult<T> {
 		let thism = this as any as Stream<Stream<T>>;
 		let ret: Stream<unknown> = thism.match
-			(a => a.maybe(thism as any)(s => ensureIsStream(s)))
-			((a, m) => a.maybe(Stream.next(Maybe.nothing, m.fmap(ss => ss.join())))(s => ensureIsStream(s).switchS(m)))
+			(a => a.maybe(thism as any)(s => ensureStream(s)))
+			((a, m) => a.maybe(Stream.next(Maybe.nothing, m.fmap(ss => ss.join())))(s => ensureStream(s).switchS(m)))
 		return ret as any;
 	}
 
 	// switch 'this' stream on future stream of streams 'mss' -- usage: s.switchS(mss) 
 	switchS(mss: AsyncM<Stream<Stream<T>>>): Stream<T> {
-		const h = (ms: AsyncM<Stream<T>>) => (mss: AsyncM<Stream<Stream<T>>>) =>
+		const h = (ms: AsyncM<Stream<T>>) => (mss: AsyncM<Stream<Stream<T>>>): AsyncM<Stream<T>> =>
 			AsyncM.any(mss)(ms.unscope()).fmap(r =>
 				r.either
 					(ss => ss.join())
@@ -492,45 +515,24 @@ abstract class Stream<T> {
 	// only return the shareable stream
 	multicast() { return this.multicast_().fmap(([s, _]) => s); }
 
-	// apply each event in 'this' to each event in 'sx'
-	combineLatest(sx) {
-		const _appF = sf => sx => sf.match(f => _appX(f)(sx))
-			((f, mf) => _appFX(f, mf)(sx))
-
-		const _appX = f => sx => sx.match(x => Stream.end(f.app(x)))
-			((x, mx) => Stream.next(f.app(x), mx.fmap(sx => _appX(f)(sx))))
-
-		const _appFX = (f, mf) => sx => sx.match
-			(x => Stream.next(f.app(x), mf.fmap(sf => _appF(sf)(sx))))
-			((x, mx) => Stream.next(f.app(x),
-				mf.spawn().bind(mf1 =>
-					mx.spawn().bind(mx1 =>
-						AsyncM.any(mf1)(mx1).bind(r => AsyncM.pure(
-							r.either(sf => _appF(sf)(Stream.next(x, mx1)))
-								(sx => _appFX(f, mf1)(sx))
-						))))))
-
-		return _appF(this)(sx);
-	}
-
 	// zip 'this' with 'that' streams as a stream of pairs -- some events may be lost 
-	zip(that) {
+	zip<R>(that: Stream<R>): Stream<[T,R]> {
 		return this.match
 			(a1 => that.match
 				(a2 => Stream.end(Maybe.pair(a1)(a2)))
 				((a2, _) => Stream.end(Maybe.pair(a1)(a2))))
 			((a1, m1) => that.match(a2 => Stream.end(Maybe.pair(a1)(a2)))
 				((a2, m2) => Stream.next(Maybe.pair(a1)(a2),
-					AsyncM.all(m1)(m2).bind(([s1, s2]) =>
-						AsyncM.ifAlive.bind(_ =>
+					AsyncM.all(m1)(m2).bind(([s1, s2]: [Stream<T>, Stream<R>]): AsyncM<Stream<[T,R]>> =>
+						AsyncM.ifAlive.bind(() =>
 							AsyncM.pure(s1.zip(s2)))))));
 	}
 
 	// zip a stream with indices starting from 'i'
-	zipWithIndex(i: number) {
+	zipWithIndex(i: number): Stream<[number, T]> {
 		return this.match
-			(a => Stream.end(a.fmap(a => [i, a])))
-			((a, m) => Stream.next(a.fmap(a => [i, a]), m.fmap(s => s.zipWithIndex(i + 1))));
+			(a => Stream.end(a.fmap((a: T): [number, T] => [i, a])))
+			((a, m) => Stream.next(a.fmap((a: T): [number, T] => [i, a]), m.fmap(s => s.zipWithIndex(i + 1))));
 	}
 
 	// cancel the progress of a stream after reaching its end
@@ -563,19 +565,19 @@ abstract class Stream<T> {
 
 	// drop n events (Nothing does not count)
 	drop(n: number): Stream<T> {
-		const h = n => s => (n <= 0)
+		const h = (n: number) => (s: Stream<T>): Stream<T> => (n <= 0)
 			? s
 			: s.match
 				(() => Stream.end(Maybe.nothing))
-				((a, m) => Stream.next(Maybe.nothing, m.fmap(s => h(a.maybe(n)(_ => n - 1))(s))))
+				((a, m) => Stream.next(Maybe.nothing, m.fmap(s => h(a.maybe(n)(() => n - 1))(s))))
 
 		return h(n)(this).just();
 	}
 
 	// omit the nothing events in a stream except the first one
 	just(): Stream<T> {
-		const h = s => s.match
-			(_ => AsyncM.pure(s))
+		const h = (s: Stream<T>): AsyncM<Stream<T>> => s.match
+			(() => AsyncM.pure(s))
 			((a, m) => a.maybe(m.bind(h))(x => AsyncM.pure(Stream.next(Maybe.just(x), m.bind(h)))));
 
 		return this.match
@@ -631,8 +633,8 @@ abstract class Stream<T> {
 
 	// return the last event of 'this' stream before 'm' emits
 	last(m: AsyncM<any>): AsyncM<Maybe<T>> {
-		return m.spawn().bind(m1 => {
-			const h = (s: Stream<T>) => s.match
+		return m.spawn().bind((m1: AsyncM<any>) => {
+			const h = (s: Stream<T>): AsyncM<Maybe<T>> => s.match
 				(a => AsyncM.pure(a))
 				((a, m) => AsyncM.any(m)(m1).bind(r => r.either(h)(_ => AsyncM.pure(a))))
 			return h(this)
@@ -651,7 +653,7 @@ abstract class Stream<T> {
 	}
 
 	// run 'this' stream until the future stream 'ms' emits its stream
-	until(ms: AsyncM<Stream<T>>): Stream<T> {
+	until(ms: AsyncM<Stream<any>>): Stream<T> {
 		return Stream.next(Maybe.just(this as Stream<T>), ms.fmap(s => Stream.pure(s))).join();
 	}
 
@@ -684,15 +686,17 @@ abstract class Stream<T> {
 	// f(x) ==  0 means no change (right speed)
 	// f(x) ==  1 means True (too fast)
 	// f(x) == -1 means False (too slow)
-	speedControl = duration => f => {
-		const ms = AsyncM.timeout(duration).bind(_ =>
-			this.speed(duration).bind(x => {
-				// console.log(x); 
-				const d = f(x)
-				return (d == 0) ? ms : AsyncM.pure(d == 1);
-			})
-		)
-		return ms;
+	speedControl(duration: Duration): (f: Func<number, number>) => AsyncM<boolean> {
+		return (f) => {
+			const ms: AsyncM<boolean> = AsyncM.timeout(duration).bind(_ =>
+				this.speed(duration).bind(x => {
+					// console.log(x); 
+					const d = f(x)
+					return (d == 0) ? ms : AsyncM.pure(d == 1);
+				})
+			)
+			return ms;
+		}
 	}
 
 	// convert 'this' stream to a pull signal
@@ -718,8 +722,8 @@ abstract class Stream<T> {
 	static pure = <A>(x: A): Stream<A> => Stream.end(Maybe.just(x));
 
 	// emits a number from 1 to n every 'dt' milliseconds 
-	static interval = (dt: number, n: number): Stream<number> => {
-		const h = x => (x >= n) ? AsyncM.pure(Stream.end(Maybe.just(x))) :
+	static interval = (dt: Duration, n: number): Stream<number> => {
+		const h = (x: number): AsyncM<Stream<number>> => (x >= n) ? AsyncM.pure(Stream.end(Maybe.just(x))) :
 			AsyncM.ifAlive.bind(_ =>
 				AsyncM.pure(
 					Stream.next(Maybe.just(x),
@@ -729,10 +733,11 @@ abstract class Stream<T> {
 	}
 
 	// an indirect way to make an interval
-	static interval_ = (dt: number, n: number): Stream<number> => Stream.forever(dt).zipWithIndex(0).fmap(([i, _]) => i).take(n);
+	static interval_ = (dt: Duration, n: number): Stream<number> =>
+		Stream.forever(dt).zipWithIndex(0).fmap(([i, _]) => i).take(n);
 
 	// emit unit every 'dt' millisecond forever.
-	static forever = (dt: number): Stream<Unit> => AsyncM.timeout(dt).repeatS();
+	static forever = (dt: Duration): Stream<Unit> => AsyncM.timeout(dt).repeatS();
 
 	// return a finite stream with elements in 'lst' 
 	static fromList = <T>(lst: T[]): Stream<T> => {
@@ -746,39 +751,72 @@ abstract class Stream<T> {
 	// converts a stream of requests (of the sampling period 'dt' and latency 'delay') to a stream of (dt, a) pairs
 	//
 	// request :: (Time -> AsyncM a) -> Time -> Time -> Stream (Time, a)
-	static request = <A>(async_fun: (time: number) => AsyncM<A>) => (dt: number) => (delay: number): Stream<[number, A]> =>
-		Stream.forever(delay).fmap(_ => async_fun(dt)).fetch<A>().fmap(x => [dt, x]);
+	static request = <A>(async_fun: Func<Duration, AsyncM<A>>) =>
+		(dt: Duration) =>
+			(delay: Duration): Stream<[Duration, A]> =>
+				Stream.forever(delay).fmap(_ => async_fun(dt)).fetch<A>().fmap(x => [dt, x]);
+
 
 	// control the speed of a stream of requests by adjusting the sampling rate 'dt' using the 'adjust' function
 	//
 	// control :: (t -> Stream (AsyncM a)) -> Int -> t -> (Bool -> t -> t) -> Stream (t, a) 
-	static control = <A>(req_fun: (a: number) => Stream<AsyncM<A>>) => (duration: number) => (dt: number) => (adjust: (b: boolean) => (c: number) => number): Stream<[number, A]> => {
-		const h = dt =>
-			req_fun(dt).multicast_().bind(([request, p1]) =>
-				request.fetch<A>().multicast_().bind(([response, p2]) => {
-					const mss = AsyncM.timeout(duration).bind(_ =>
-						AsyncM.all(response.count(duration))(request.count(duration))
-							.bind(([x, y]) => {
-								// console.log(x,y); 
-								if (x == y) { return mss; }
-								else {
-									p1.cancelP();
-									p2.cancelP();
-									return AsyncM.pure(h(adjust(x < y)(dt)));
-								}
-							})
-					);
+	static control = <A>(req_fun: Func<Duration, Stream<AsyncM<A>>>) =>
+		(duration: Duration) =>
+			(dt: Duration) =>
+				(adjust: Func<boolean,Func<Duration,Duration>>): Stream<[Duration, A]> => {
+					const h = (dt: Duration) =>
+						req_fun(dt).multicast_().bind(([request, p1]) =>
+							request.fetch<A>().multicast_().bind(([response, p2]) => {
+								const mss: AsyncM<Stream<Stream<[Duration, A]>>> = AsyncM.timeout(duration).bind(_ =>
+									AsyncM.all(response.count(duration))(request.count(duration))
+										.bind(([x, y]) => {
+											// console.log(x,y); 
+											if (x == y) { return mss; }
+											else {
+												p1.cancelP();
+												p2.cancelP();
+												return AsyncM.pure(h(adjust(x < y)(dt)));
+											}
+										})
+								);
 
-					return Stream.next(Maybe.just(response.fmap(<R>(x:R): [number, R] => [dt, x])), mss);
-				}));
+								return Stream.next(Maybe.just(response.fmap(<R>(x:R): [number, R] => [dt, x])), mss);
+							}));
 
-		return h(dt).join();
-	}
+					return h(dt).join();
+				}
 
 	// converts a  stream of requests (of the sampling period 'dt') to an Event Siganl
 	//
 	// fetchE  :: (Time -> Stream (AsyncM a)) -> Time -> AsyncM (Event a)
-	static fetchE = req_fun => dt => req_fun(dt).fetch().fmap(x => [dt.x]).push2pull()
+	static fetchE = <A>(req_fun: Func<Duration, Stream<AsyncM<A>>>) =>
+		(dt: Duration) =>
+			req_fun(dt).fetch().fmap(x => [dt, x]).push2pull()
+}
+
+// apply each event in 'this' to each event in 'sx'
+function combineLatest<T,R>(sf: Stream<Func<T,R>>, sx: Stream<T>): Stream<R> {
+	const _appF = (sf: Stream<Func<T,R>>) => (sx: Stream<T>) =>
+		sf.match
+			(f => _appX(f)(sx))
+			((f, mf) => _appFX(f, mf)(sx))
+
+	const _appX = (f:Maybe<Func<T,R>>) => (sx:Stream<T>): Stream<R> =>
+		sx.match
+			(x => Stream.end(f.app(x)))
+			((x, mx) => Stream.next(f.app(x), mx.fmap(sx => _appX(f)(sx))))
+
+	const _appFX = (f: Maybe<Func<T,R>>, mf: AsyncM<Stream<Func<T,R>>>) => (sx: Stream<T>): Stream<R> => sx.match
+		(x => Stream.next(f.app(x), mf.fmap(sf => _appF(sf)(sx))))
+		((x, mx) => Stream.next(f.app(x),
+			mf.spawn().bind(mf1 =>
+				mx.spawn().bind(mx1 =>
+					AsyncM.any(mf1)(mx1).bind(r => AsyncM.pure(
+						r.either(sf => _appF(sf)(Stream.next(x, mx1)))
+							(sx => _appFX(f, mf1)(sx))
+					))))))
+
+	return _appF(sf)(sx);
 }
 
 class End<T> extends Stream<T> {
@@ -827,16 +865,15 @@ class Signal<T> {
 	// f <$> this
 	fmap<R>(f: (a: T) => R): Signal<R> { return new Signal(() => this.run().then(f)); }
 
-	// FIXME
 	// this <*> gx
-	app<A,B>(gx: Signal<A>): Signal<B> {
-		let thism = this as unknown as Signal<(a: A) => B>;
-		return new Signal(() => Promise.all([thism.run(), gx.run()]).then(([f, x]) => f(x)));
+	app<A>(gx: Signal<A>): SignalAppResult<T,A> {
+		let thism = this.fmap(ensureFunction);
+		return new Signal(() => Promise.all([thism.run(), gx.run()]).then(([f, x]) => f(x))) as any;
 	}
 
 	// run a signal as a stream with added 'delay' between events
 	reactimate(delay: number): Stream<T> {
-		const h = AsyncM.timeout(delay).bind(_ =>
+		const h: AsyncM<Stream<T>> = AsyncM.timeout(delay).bind(_ =>
 			AsyncM.ifAlive.bind(_ =>
 				AsyncM.liftIO_(this.run()).bind(a =>
 					AsyncM.pure(Stream.next(Maybe.just(a), h))
@@ -845,59 +882,57 @@ class Signal<T> {
 		)
 		return Stream.next(Maybe.nothing, h)
 	}
-
-	// The following two methods only make sense for 'Signal (Time, a)' (i.e. 'Event a')
-
-	// convert an Event Signal to a Behavior using a summary function 
-	//
-	// stepper :: Signal (Time, a) -> ([(Time, a)] -> a) -> Behavior a	
-	// FIXME
-	stepper<A>(summary: (a: [number,A]) => A): Behavior<A> {
-		let thism = this as unknown as Signal<[number,A]>;
-
-		let leftover = null;
-		const f = lst => (lst.length == 1) ? lst[0][1] : summary(lst);
-
-		const h = async dt => {
-			let lst = [];
-
-			if (leftover == null) { leftover = await thism.run(); }
-			let [dt1, a] = leftover;
-
-			while (dt > dt1) {
-				lst.push([dt1, a]);
-				dt = dt - dt1;
-				[dt1, a] = await thism.run();
-			}
-			leftover = (dt == dt1) ? null : [dt1 - dt, a];
-
-			lst.push([dt, a]);
-
-			return f(lst);
-		};
-
-		return new Behavior(h);
-	}
-
-	// convert an Event Signal of batches to an Event Signal of samples
-	//
-	// unbatch :: Signal (Time, [a]) -> Signal (Time, a)
-	unbatch() {
-		let leftover = null;
-
-		let h = async () => {
-			if (leftover == null) { leftover = await this.run(); }
-			let [dt, lst] = leftover;
-
-			const a = lst.shift();
-
-			if (lst.length == 0) { leftover = null; }
-
-			return [dt, a];
-		}
-		return new Signal(h);
-	}
 }
+
+// The following two methods only make sense for 'Signal (Time, a)' (i.e. 'Event a')
+
+// convert an Event Signal to a Behavior using a summary function 
+//
+// stepper :: Signal (Time, a) -> ([(Time, a)] -> a) -> Behavior a	
+function stepper<A>(s: Signal<[Duration, A]>, summary: Func<[Duration, A][], A>): Behavior<A> {
+	let leftover: [Duration, A] | null = null;
+	const f = (lst: [Duration, A][]) => (lst.length == 1) ? lst[0][1] : summary(lst);
+
+	const h = async (dt: Duration) => {
+		let lst: [Duration, A][] = [];
+
+		if (leftover == null) { leftover = await s.run(); }
+		let [dt1, a] = leftover;
+
+		while (dt > dt1) {
+			lst.push([dt1, a]);
+			dt = dt - dt1;
+			[dt1, a] = await s.run();
+		}
+		leftover = (dt == dt1) ? null : [dt1 - dt, a];
+
+		lst.push([dt, a]);
+
+		return f(lst);
+	};
+
+	return new Behavior(h);
+}
+
+// convert an Event Signal of batches to an Event Signal of samples
+//
+// unbatch :: Signal (Time, [a]) -> Signal (Time, a)
+function unbatch<A>(s: Signal<[Duration, A[]]>): Signal<[Duration, A]> {
+	let leftover: [Duration, A[]] | null = null;
+
+	let h = async (): Promise<[Duration, A]> => {
+		if (leftover == null) { leftover = await s.run(); }
+		let [dt, lst] = leftover;
+
+		const a: A = lst.shift()!;
+
+		if (lst.length == 0) { leftover = null; }
+
+		return [dt, a];
+	}
+	return new Signal(h);
+}
+
 
 /*
  * The behavior class -- also imperative like the Signal class
@@ -920,15 +955,15 @@ class Behavior<T> {
 	fmap<R>(f: (a: T) => R) { return new Behavior(dt => this.run(dt).then(x => f(x))); }
 
 	// this <*> bx
-	app<A,B>(bx: Behavior<A>) {
-		let thism = this as unknown as Behavior<(a: A) => B>;
-		return new Behavior(dt => Promise.all([thism.run(dt), bx.run(dt)]).then(([f, x]) => f(x)));
+	app<A>(bx: Behavior<A>): BehaviorAppResult<T, A> {
+		let thism = this.fmap(ensureFunction);
+		return new Behavior(dt => Promise.all([thism.run(dt), bx.run(dt)]).then(([f, x]) => f(x))) as any;
 	}
 
 	// run 'this' behavior as a stream with added 'delay' between events and sampling period 'dt' 
-	reactimate(delay): (dt: number) => Stream<T> {
+	reactimate(delay: Duration): (dt: Duration) => Stream<[Duration, T]> {
 		return dt => {
-			const h = AsyncM.timeout(delay).bind(_ =>
+			const h: AsyncM<Stream<[Duration, T]>> = AsyncM.timeout(delay).bind(_ =>
 				AsyncM.ifAlive.bind(_ =>
 					AsyncM.liftIO_(this.run(dt)).bind(a =>
 						AsyncM.pure(Stream.next(Maybe.just([dt, a]), h))
@@ -970,7 +1005,7 @@ class Behavior<T> {
 		return summary => new Behavior(
 			async dt => {
 				const dt1 = dt / factor
-				let lst = [];
+				let lst: [number, T][] = [];
 
 				for (let i = 0; i < factor; i++) {
 					let x = await this.run(dt1);
@@ -987,7 +1022,7 @@ class Behavior<T> {
 	// windowing :: Behavior a -> Int -> Int -> Time -> Event [a]
 	windowing(size: number): (stride: number) => (dt: number) => Signal<[number,T[]]> {
 		return stride => dt => {
-			const _lst = []; // Hack: stores the temporary window in shared variable '_lst' 
+			const _lst: T[] = []; // Hack: stores the temporary window in shared variable '_lst' 
 
 			return new Signal(async () => {
 				if (_lst.length == 0) {
@@ -1030,8 +1065,8 @@ tm1.run(Progress.nil());
 
 // Stream.interval(100, 5).run(x => console.log(x)).run(Progress.nil())(x=>x);
 
-const s1 = Stream.interval(100, 5);
-const s2 = Stream.interval(50, 10);
+const s1 = Stream.interval(100, 5)
+const s2 = Stream.interval(50, 10)
 
 // s1.fmap(x => x*10).run(x => console.log(x)).run(Progress.nil())(x=>x);
 // s1.bind (x => Stream.pure(x*10)).run(x => console.log(x)).run(Progress.nil())(x=>x);
@@ -1048,14 +1083,14 @@ const t1 = s1.multicast().bind(s11 =>
 
 const t2 = s1.multicast().bind(s11 =>
 	s2.multicast().bind(s21 =>
-		Stream.pure(a => b => [a, b]).app(s11).app(s21)
+		Stream.pure((a: any) => (b: any) => [a, b]).app(s11).app(s21)
 	))
 
-const t3 = s1.fmap(a => b => [a, b]).combineLatest(Stream.pure(10))
+const t3 = combineLatest(s1.fmap((a: any) => (b: any) => [a, b]), Stream.pure(10))
 
-const t4 = Stream.pure(a => [a]).combineLatest(s2)
+const t4 = combineLatest(Stream.pure((a: any) => [a]), s2)
 
-const t5 = s1.fmap(a => b => [a, b]).combineLatest(s2)
+const t5 = combineLatest(s1.fmap((a: any) => (b: any) => [a, b]), s2)
 
 const t6 = s1.zip(s2)
 
@@ -1067,7 +1102,7 @@ const t9 = Stream.interval_(100, 10)
 
 const t10 = s2.stop(200)
 
-const t11 = s2.fmap(x => c => x + c).accumulate(0)
+const t11 = s2.fmap((x: any) => (c: any) => x + c).accumulate(0)
 
 const t12 = s2.until(AsyncM.timeout(200).fmap(_ => s1))
 
@@ -1078,7 +1113,7 @@ const t14 = s1.fmap(x => AsyncM.timeout(500).fmap(_ => x)).fetch()
 const t15 = Stream.request(n => AsyncM.timeout(n).fmap(_ => 'data'))(500)(10).take(10)
 
 // test adjusting sampling rate for data requests
-const req_fun = dt => Stream.forever(10)
+const req_fun = (dt: Duration) => Stream.forever(10)
 	.fmap(_ => {
 		const dt1 = Math.round(Math.random() * dt);
 		return AsyncM.timeout(dt1).fmap(_ => dt1)
@@ -1090,7 +1125,7 @@ const t16 = Stream.control(req_fun)(200)(20)(b => t => Math.round(b ? t / 1.1 : 
 const t17 = s1.push2pull().liftS().bind(g => g.reactimate(20))
 
 // a summary function based on weighted average
-const avg = lst => {
+const avg = (lst: [Duration, number][]) => {
 	let t = 0, sum = 0;
 	for (const [dt, a] of lst) {
 		t = t + dt;
@@ -1099,65 +1134,68 @@ const avg = lst => {
 	return sum / t;
 }
 // test stepper
-const t18 = s2.fmap(x => [50, x]) 		// s2 is a stream with dt = 50ms
+const t18 = s2.fmap((x: any): [Duration, number] => [50, x]) 		// s2 is a stream with dt = 50ms
 	.until(
 		AsyncM.timeout(200).fmap(_ =>	// switch fter 200 ms 
 			s1.fmap(x => [100, x]))	// s1 is a stream with dt = 100ms  
 	)
 	.push2pull().liftS() 		// convert to event
 	.bind(g =>
-		g.stepper(avg) 		// convert to behavior
+		stepper(g, avg) 		// convert to behavior
 			.reactimate(10)(40) 	// run it with 10m delay and 40ms sample-period
 	)
 
 // test unbatch
-const t19 = s2.fmap(x => [50, Array(x).fill(x)]) // a stream of (Time, array)
+const t19 = s2.fmap((x: any): [Duration, any[]] => [50, Array(x).fill(x)]) // a stream of (Time, array)
 	.push2pull().liftS()		// convert to event
 	.bind(g =>
-		g.unbatch() 		// unbatch
+		unbatch(g) 		// unbatch
 			.reactimate(10)		// run it with 10ms delay
 	)
 // test downsample
-const t20 = s2.fmap(x => [50, x])
+const t20 = s2.fmap((x: any): [Duration, any] => [50, x])
 	.push2pull().liftS()
 	.bind(g =>
-		g.stepper(avg)		// convert to a behavior
+		stepper(g, avg)		// convert to a behavior
 			.fmap(x => x * 10)	// times 10
 			.downsample(2)(avg)	// downsample by a factor of 2
 			.reactimate(10)(100)	// run it with 10ms delay and 100ms sample-period
 	)
 // test windowing
-const t21 = s2.fmap(x => [50, Array(5).fill(x)]) // a stream of batches
+const t21 = s2.fmap((x: any): [Duration, any[]] => [50, Array(5).fill(x)]) // a stream of batches
 	.push2pull().liftS()		// convert to an event of batches
-	.bind(g =>
-		g.unbatch()		// unbatch the event
-			.stepper(avg)		// convert to a behavior
+	.bind(g => {
+		let b = unbatch(g);		// unbatch the event
+		return stepper(b, avg)		// convert to a behavior
 			.windowing(5)(2)(50)	// make a window of size 5 and stride 2 with 50ms sample-period
-			.reactimate(10)
-	)
-// test behavior <*>
-const se1 = s1.fmap(x => [100, x]).push2pull().liftS()
-const se2 = s2.fmap(x => [50, x]).push2pull().liftS()
-const t22 = se1.bind(e1 =>
-	se2.bind(e2 => {
-		const b1 = e1.stepper(avg)
-		const b2 = e2.stepper(avg)
-		const b = Behavior.pure(x => y => [x, y]).app(b1).app(b2)
-		return b.reactimate(10)(25);
-	}))
+			.reactimate(10);
+	})
 
-const t23 = s2.fmap(x => [45, x]).speedControl(200)(r => (r > 0.9) ? 0 : -1)
+// test behavior <*>
+const se1 = s1.fmap((x: any): [Duration, any] => [100, x]).push2pull().liftS()
+const se2 = s2.fmap((x: any): [Duration, any] => [50, x]).push2pull().liftS()
+const t22 =
+	se1.bind(e1 =>
+	se2.bind(e2 => {
+		const b1 = stepper(e1, avg);
+		const b2 = stepper(e2, avg);
+		const b = Behavior.pure((x: any) => (y: any) => [x, y]).app(b1).app(b2);
+		return b.reactimate(10)(25);
+	}));
+
+const t23 = s2.fmap(x => [45, x]).speedControl(200)(r => (r > 0.9) ? 0 : -1);
 // t23.run(Progress.nil()).then(x => console.log(x))
 
 
 // test batch
-const t24 = Stream.interval(1000, 10).fmap(x => [10, Array(1000).fill(x)]) // a stream of (Time, Number)
+const t24 = Stream.interval(1000, 10).fmap((x: number): [Duration, number[]] => [10, Array(1000).fill(x)]) // a stream of (Time, Number)
 	.push2pull().liftS()		// convert to batch event
-	.bind(g => g.unbatch()          // convert to sample event 
-		.stepper(avg) 		// convert to behavior
-		.batch(100)(100)        // convert to batch
-		.reactimate(1)		// run it with 1ms delay
-	)
+	.bind(g => {
+		let b = unbatch(g);          // convert to sample event 
+		return stepper(b, avg) 		// convert to behavior
+			.batch(100)(100)        // convert to batch
+			.reactimate(1)		// run it with 1ms delay
+	});
 
 // test zip
 const t25 = Stream.interval(100, 30).multicast().bind(s1 =>
@@ -1169,5 +1207,3 @@ const t26 = s2.skip(200)
 
 // The first 'run' returns an 'AsyncM' and the second 'run' executes the 'AsyncM'.
 t5.run(x => console.log(x)).run(Progress.nil());
-
-
