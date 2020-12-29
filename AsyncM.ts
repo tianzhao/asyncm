@@ -21,30 +21,34 @@ type StreamJoinResult<T> = T extends Stream<infer R> ? Stream<R> : never;
 type SignalAppResult<T, A> = T extends Func<A, infer B> ? Signal<B> : never;
 type BehaviorAppResult<T, A> = T extends Func<A, infer B> ? Behavior<B> : never;
 
-type Ease<T> = unknown extends T ? any : T;
+type IfUnknown<T, AS, ELSE> = unknown extends T ? AS : ELSE;
+type Ease<T> = IfUnknown<T, any, T>;
 
+type EnsureTuple<T> = T extends [infer A, infer B] ? [Ease<A>, Ease<B>] : never;
+type EnsureFunc<T> = T extends Func<infer A, infer B> ? Func<Ease<A>,Ease<B>> : never;
+type EnsureAsyncM<T> = T extends AsyncM<infer A> ? AsyncM<A> : never;
+type EnsureStream<T> = T extends Stream<infer A> ? Stream<A> : never;
 
 function isFunction<A,B>(f: any): f is Func<A,B> {
 	return typeof f === "function";
 }
-
-function ensureTuple<T,A,B>(t: T): T extends [A,B] ? [Ease<A>, Ease<B>] : never {
+function ensureTuple<T>(t: T): IfUnknown<T, [any, any], EnsureTuple<T>> {
 	if (t instanceof Array) return t as any;
 	throw new TypeError();
 }
 
-function ensureFunction<A,B>(f: any): Func<A,B> {
-	if (f instanceof Function) return f;
+function ensureFunction<T>(f: T): IfUnknown<T, Func<any, any>, EnsureFunc<T>> {
+	if (f instanceof Function) return f as any;
 	throw new TypeError();
 }
 
-function ensureAsyncM<A>(m: unknown): AsyncM<A> {
-	if (m instanceof AsyncM) return m;
+function ensureAsyncM<T>(m: T): IfUnknown<T, AsyncM<any>, EnsureAsyncM<T>> {
+	if (m instanceof AsyncM) return m as any;
 	throw new TypeError();
 }
 
-function ensureStream<A>(m: unknown): Stream<A> {
-	if (m instanceof Stream) return m;
+function ensureStream<T>(m: T): IfUnknown<T, Stream<any>, EnsureStream<T>> {
+	if (m instanceof Stream) return m as any;
 	throw new TypeError();
 }
 
