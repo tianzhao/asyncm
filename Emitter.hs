@@ -54,6 +54,7 @@ waitE (Emitter av kv) = asyncM $ \p k ->
                           -- must one 'waitE' on each 'e' at a time
 
 -- This is blocking!
+now :: Emitter a -> IO a
 now (Emitter av _) = readMVar av 
 
 runE :: Emitter a -> (a -> IO ()) -> AsyncM ()

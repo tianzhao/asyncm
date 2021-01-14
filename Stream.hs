@@ -15,6 +15,7 @@ module Stream
   , multicast
   , interval
   , interval'
+  , interval_
   , accumulate
   , foldS
   , countS
@@ -34,12 +35,18 @@ module Stream
   , DTime (..)
   , fetchS
   , concatS
+  , justS
+  , dropS
+  , delayS
+  , delayS_
+  , minChangeInterval
+  , sampleInterval
   ) where
 
 import Control.Monad (join)
 import Control.Monad.Cont (liftIO)
 import AsyncM (AsyncM (..), ifAliveM, raceM, runM_, timeout, neverM, forkM, advM, commitM, cancelM, scopeM, unscopeM, allM, anyM)
-import Emitter (Emitter (..), emit, listen, newEmitter_, spawnM)
+import Emitter (Emitter (..), emit, listen, newEmitter_, spawnM, waitE, now)
 import Progress (Progress (..), cancelP)
 import Control.Monad.IO.Class (MonadIO)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
@@ -129,12 +136,13 @@ interval dt n = Next Nothing (timeout 1 >> h 1)
   where h x = if x >= n then return $ End (Just x)
               else do ifAliveM
                       return $ Next (Just x) (timeout dt >> h (x+1))
+--interval dt n = delayS 1 $ fromList [1..n]
 
 broadcast_ :: Stream a -> AsyncM (Emitter a, Progress)
 broadcast_ s = do 
-     e <- liftIO newEmitter_ 
-     p <- forkM $ runS s $ emit e 
-     return (e, p)
+   e <- liftIO newEmitter_ 
+   p <- forkM $ runS s $ emit e 
+   return (e, p)
 
 broadcast :: Stream a -> AsyncM (Emitter a)
 broadcast s = fst <$> broadcast_ s
@@ -193,6 +201,10 @@ zipS (Next a1 ms1) (Next a2 ms2) = Next (pure (,) <*> a1 <*> a2) ms
 repeatS :: AsyncM a -> Stream a
 repeatS m = Next Nothing (repeatA m)
 
+repeatS' :: a -> AsyncM a -> Stream a
+repeatS' a m = Next (Just a) (repeatA m)
+
+
 repeatA :: AsyncM a -> AStream a
 repeatA m = do a <- m
                ifAliveM
@@ -212,17 +224,18 @@ zipWithIndex s = zipS (fromList [1..]) s
 justS :: Stream a -> Stream a
 justS (End a) = End a
 justS (Next a ms) = Next a (ms >>= h)
-  where h (Next Nothing ms) = ms >>= h
+  where h (Next Nothing ms)  = ms >>= h
         h (Next (Just x) ms) = return $ Next (Just x) (ms >>= h)
-        h (End a) = return $ End a
+        h (End a)            = return $ End a
 
 -- take the first n events. If n <= 0, then nothing
 -- if 's' has less than n events, the 'takeS n s' emits all events of s
 takeS :: Int -> Stream a -> Stream a
 takeS n s = if n <= 0 then End Nothing else f n s
   where f 1 (Next (Just x) _) = End (Just x)
-        f n (Next a ms) = Next a $ takeS (maybe n (\_->n-1) a) <$> ms
-        f _ (End a) = End a
+        f n (Next a ms)       = Next a $ takeS (maybe n (\_->n-1) a) <$> ms
+        f _ (End a)           = End a
+
 
 -- explicitly cancel a stream after it reaches the 'End'
 endS (End a) = End a
@@ -231,6 +244,7 @@ endS (Next a ms) = Next a $ scopeM $ f ms
                  case s of End a -> cancelM >> return (End a) 
                            Next a m' -> return $ Next a $ f m'
 
+-- FIXME can ends before n events
 -- take n events from s and cancel s explicitly
 takeS_ n s = endS $ takeS n s
 
@@ -257,6 +271,12 @@ delayS dt s = Next Nothing (h s)
   where h (Next a ms) = timeout dt >> (return $ Next a (ms >>= h))
         h (End a) = timeout dt >> (return $ End a)
 
+-- does not affect the initial event
+delayS_ :: DTime -> Stream a -> Stream a
+delayS_ dt (End a)     = End a
+delayS_ dt (Next a ms) = Next a (timeout dt >> (delayS_ dt <$> ms))
+
+
 -- stop 's' after dt milliseconds
 stopS :: DTime -> Stream a -> Stream a
 -- stopS dt s = s `untilS` (timeout dt >> return (End Nothing))
@@ -264,7 +284,13 @@ stopS _ (End a) = End a
 stopS dt s = s `switchS` (timeout dt >> return (End Nothing))
 
 -- start the first index after dt
-interval' dt n = takeS n $ fmap fst $ zipWithIndex $ foreverS dt
+interval' :: DTime -> Int -> Stream Int
+interval' dt n = delayS dt $ fromList [1..n]
+
+interval_ :: DTime -> Int -> Stream Int
+interval_ dt n
+    | n > 0     = delayS_ dt $ fromList [1..n]
+    | otherwise = End Nothing
 
 -----------------------------------------------------------------------
 
@@ -290,6 +316,7 @@ countS n s = foldS n 0 $ (+1) <$ s
 -- run s until ms occurs and then runs the stream in ms
 untilS :: Stream a -> AStream a -> Stream a
 untilS s ms = joinS $ Next (Just s) (pure <$> ms)
+
 
 -----------------------------------------------------------------------
 
@@ -324,4 +351,25 @@ controlS req_fun duration dt adjust = join $ h dt
                   Just ((,) dt <$> response) `Next` mss
 
 -----------------------------------------------------------------------
+
+minChangeInterval :: DTime -> Stream a -> Stream a
+minChangeInterval _  (End a)     = End a
+minChangeInterval dt (Next a ms) =
+  Next a $ return . (minChangeInterval dt) . fst =<< allM ms (timeout dt)
+
+-- TODO cancel
+sampleInterval :: DTime -> Stream a -> Stream a
+sampleInterval dt (End a)      = End a
+sampleInterval dt s@(Next a _) = Next a ms
+  where ms = do (e, p) <- broadcast_ s
+                return $ delayS_ dt $ repeatS $ liftIO $ now e
+
+
+controlS' :: Stream a -> Stream DTime -> DTime -> Stream a
+controlS' sa st t0 = undefined
+
+
+controlS_ :: Stream a -> Stream DTime -> Stream a
+controlS_ = undefined
+
 
