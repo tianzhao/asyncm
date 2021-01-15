@@ -29,6 +29,7 @@ module Stream
   , stopS
   , zipS
   , fromList
+  , fromDelayedList
   , zipWithIndex
   , controlS
   , mergeS
@@ -41,6 +42,9 @@ module Stream
   , delayS_
   , minChangeInterval
   , sampleInterval
+  , switchMap
+  , controlS'
+  , controlS''
   ) where
 
 import Control.Monad (join)
@@ -217,6 +221,12 @@ fromList :: [a] -> Stream a
 fromList [] = End Nothing 
 fromList (a:t) = Next (Just a) (return $ fromList t)
 
+fromDelayedList :: [(DTime, a)] -> Stream a
+fromDelayedList [] = End Nothing
+fromDelayedList ((t,a):r) = Next Nothing (return (h a r) <* timeout t)
+  where h a' []        = End (Just a')
+        h a' ((t,b):r) = Next (Just a') (return (h b r) <* timeout t)
+
 zipWithIndex :: Stream a -> Stream (Int, a)
 zipWithIndex s = zipS (fromList [1..]) s
 
@@ -364,10 +374,29 @@ sampleInterval dt s@(Next a _) = Next a ms
   where ms = do (e, p) <- broadcast_ s
                 return $ delayS_ dt $ repeatS $ liftIO $ now e
 
+switchMap :: Stream (Stream a -> Stream b) -> Stream a -> Stream b
+switchMap sf sa = do
+  sf' <- multicast sf
+  sa' <- multicast sa
+  let h (End f)      = mf f sa'
+      h (Next f msf) = mf f sa' `untilS` (return . h =<< msf)
+  h sf'
+  where mf = maybe nothingS id
 
-controlS' :: Stream a -> Stream DTime -> DTime -> Stream a
-controlS' sa st t0 = undefined
 
+nothingS (End _)     = End Nothing
+nothingS (Next _ ms) = Next Nothing (nothingS <$> ms)
+
+
+controlS' :: Stream a -> Stream DTime -> Stream a
+controlS' sa st = do
+    st' <- multicast st
+    switchMap (return . delayS_ =<< st') sa
+
+controlS'' :: Stream a -> Stream DTime -> Stream (DTime, a)
+controlS'' sa st = do
+    st' <- multicast st
+    switchMap (return . (\t -> delayS_ t . ((,) t <$>)) =<< st') sa
 
 controlS_ :: Stream a -> Stream DTime -> Stream a
 controlS_ = undefined
