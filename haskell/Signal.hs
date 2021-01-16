@@ -13,7 +13,7 @@ import Control.Monad.Reader (ReaderT (..))
 import Control.Monad.Cont (liftIO)
 import AsyncM (AsyncM (..), ifAliveM, timeout, forkM)
 import Control.Concurrent.Chan (newChan, readChan, writeChan)
-import Stream (fetchS, Stream (..), runS, Time (..))
+import Stream (fetchS, Stream (..), runS, DTime)
 
 
 -- Pull-based stream
@@ -52,7 +52,7 @@ fetchG :: Stream (AsyncM a) -> AsyncM (Signal IO a)
 fetchG s = push2pull $ fetchS s
 
 -- run signal with event delay
-reactimate :: Time -> Signal IO a -> Stream a
+reactimate :: DTime -> Signal IO a -> Stream a
 reactimate delay g = Next Nothing (h g)
   where h g = do timeout delay
                  ifAliveM
@@ -62,27 +62,27 @@ reactimate delay g = Next Nothing (h g)
 -----------------------------------------------------------------------
 
 -- Event is a signal of delta-time and value pairs
-type Event a = Signal IO (Time, a)
+type Event a = Signal IO (DTime, a)
 
 -- Behavior is a signal of delta-time to value functions
-type Behavior a = Signal (ReaderT Time IO) a
+type Behavior a = Signal (ReaderT DTime IO) a
 
 -- make an event out of a stream of AsyncM
-fetchE :: Time -> (Time -> Stream (AsyncM a)) -> AsyncM (Event a)
+fetchE :: DTime -> (DTime -> Stream (AsyncM a)) -> AsyncM (Event a)
 fetchE dt k = push2pull $ fetchES dt k
 
-fetchES :: Time -> (Time -> Stream (AsyncM a)) -> Stream (Time, a)
+fetchES :: DTime -> (DTime -> Stream (AsyncM a)) -> Stream (DTime, a)
 fetchES dt k = (,) dt <$> (fetchS $ k dt)
 
 -- a behavior that synchronously fetches data, which is blocking and will experience all IO delays
-fetchB :: (Time -> IO a) -> Behavior a
+fetchB :: (DTime -> IO a) -> Behavior a
 fetchB k = Signal $ ReaderT $ \t -> do a <- k t
                                        return (a, fetchB k)
 
 -- Converts an event signal to a behavior signal 
 -- downsample by applying the summary function
 -- upsample by repeating events
-stepper :: ([(Time, a)] -> a) -> Event a -> Behavior a
+stepper :: ([(DTime, a)] -> a) -> Event a -> Behavior a
 stepper summary ev = Signal $ ReaderT $ \t -> h [] t ev
  where h lst t ev = do 
          ((t', a), ev') <- runSignal ev   
@@ -93,7 +93,7 @@ stepper summary ev = Signal $ ReaderT $ \t -> h [] t ev
        f lst = summary lst 
      
 -- run behavior with event delay and sample delta-time
-reactimateB :: Time -> Time -> Behavior a -> Stream (Time, a)
+reactimateB :: DTime -> DTime -> Behavior a -> Stream (DTime, a)
 reactimateB delay dt g = Next Nothing (h g)
   where h g = do timeout delay
                  ifAliveM
@@ -109,7 +109,7 @@ unbatch eb = Signal $ do
         h dt (a:b) eb' = return ((dt, a), Signal $ h dt b eb') 
 
 -- convert behavior to event of batches of provided size and delta-time
-batch :: Time -> Int -> Behavior a -> Event [a]
+batch :: DTime -> Int -> Behavior a -> Event [a]
 batch dt size g = Signal $ h [] size g
   where h b n g
          | n <= 0 = return ((dt, b), batch dt size g)
@@ -135,7 +135,7 @@ downsample factor summary b = Signal $ ReaderT $ \t ->
 -- Do NOT unbatch windowed data since the sampling time is dt*stride.
 -- convert a behavior into event of sample windows of specified size, stride, and sample delta-time
 -- resulting delta-time is 't * stride'
-window :: Int -> Int -> Time -> Behavior a -> Event [a]
+window :: Int -> Int -> DTime -> Behavior a -> Event [a]
 window size stride t b = Signal $ init size [] b
   where init 0 lst b = step 0 lst b
         init s lst b = do (a, b') <- (runReaderT $ runSignal b) t
