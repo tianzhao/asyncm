@@ -7,6 +7,8 @@ let
   ghc = haskellPackages.ghcWithPackages (ps: with ps; [
     base
     async
+    containers
+    clock
   ]);
 in
   pkgs.stdenv.mkDerivation {

@@ -29,7 +29,6 @@ module Stream
   , stopS
   , zipS
   , fromList
-  , fromDelayedList
   , zipWithIndex
   , controlS
   , mergeS
@@ -45,6 +44,7 @@ module Stream
   , switchMap
   , controlS'
   , controlS''
+  , repeatS
   ) where
 
 import Control.Monad (join)
@@ -221,12 +221,6 @@ fromList :: [a] -> Stream a
 fromList [] = End Nothing 
 fromList (a:t) = Next (Just a) (return $ fromList t)
 
-fromDelayedList :: [(DTime, a)] -> Stream a
-fromDelayedList [] = End Nothing
-fromDelayedList ((t,a):r) = Next Nothing (return (h a r) <* timeout t)
-  where h a' []        = End (Just a')
-        h a' ((t,b):r) = Next (Just a') (return (h b r) <* timeout t)
-
 zipWithIndex :: Stream a -> Stream (Int, a)
 zipWithIndex s = zipS (fromList [1..]) s
 
@@ -397,8 +391,4 @@ controlS'' :: Stream a -> Stream DTime -> Stream (DTime, a)
 controlS'' sa st = do
     st' <- multicast st
     switchMap (return . (\t -> delayS_ t . ((,) t <$>)) =<< st') sa
-
-controlS_ :: Stream a -> Stream DTime -> Stream a
-controlS_ = undefined
-
 

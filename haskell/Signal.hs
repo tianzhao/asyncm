@@ -7,6 +7,9 @@ module Signal
   , fetchG
   , fetchS
   , push2pull
+  , push2pull'
+  , bindG
+  , Signal(..)
   ) where
 
 import Control.Monad.Reader (ReaderT (..))
@@ -39,6 +42,14 @@ push2pull s =  do
      let f = do a <- readChan c
                 return (a, Signal f)
      return $ Signal f
+
+push2pull' :: Stream a -> IO () -> AsyncM (Signal IO a)
+push2pull' s m = do
+   c <- liftIO newChan
+   forkM $ runS s $ \a -> writeChan c a >> m
+   let f = do a <- readChan c
+              return (a, Signal f)
+   return $ Signal f
 
 -- run k for each event of the signal s
 bindG :: Signal IO a -> (a -> IO b) -> Signal IO b
