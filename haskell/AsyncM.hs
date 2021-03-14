@@ -20,14 +20,15 @@ module AsyncM
   , scopeM
   , unscopeM
   , anyM
-  , waitForAll
+  , waitAllAsyncM
+  , killAllAsyncM
   ) where
 
 import Progress
 
 import Control.Concurrent       (MVar (..), isEmptyMVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar,
                                  takeMVar, threadDelay)
-import Control.Concurrent.Async (Async (..), async, wait)
+import Control.Concurrent.Async (Async (..), async, uninterruptibleCancel, wait)
 import Control.Exception        (SomeException (..), catch, displayException, finally, handle)
 import Control.Monad            (void)
 import Control.Monad.Cont       (ContT (..), runContT)
@@ -43,20 +44,26 @@ newtype AsyncM a = AsyncM { runAsyncM :: ExceptT String (ReaderT Progress (ContT
 data AnyAsync where
   AnyAsync :: Async a -> AnyAsync
 
-
 asyncMThreads :: MVar [AnyAsync]
 asyncMThreads = unsafePerformIO (newMVar [])
 
-waitForAll :: IO ()
-waitForAll = do
+forAllThreads :: (AnyAsync -> IO ()) -> IO ()
+forAllThreads f = do
   ts <- takeMVar asyncMThreads
   case ts of
-    []  -> putMVar asyncMThreads [] >> pure ()
-    (AnyAsync t):ts' -> do
+    []    -> do
+      putMVar asyncMThreads []
+      pure ()
+    t:ts' -> do
       putMVar asyncMThreads ts'
-      wait t
-      waitForAll
+      f t
+      forAllThreads f
 
+waitAllAsyncM :: IO ()
+waitAllAsyncM = forAllThreads (\(AnyAsync a) -> void $ wait a)
+
+killAllAsyncM :: IO ()
+killAllAsyncM = forAllThreads (\(AnyAsync a) -> uninterruptibleCancel a)
 
 runM :: AsyncM a -> Progress -> (Either String a -> IO ()) -> IO ()
 runM (AsyncM a) p k = runContT (runReaderT (runExceptT a) p) k
@@ -130,8 +137,8 @@ anyM a1 a2 = raceM (Left <$> a1 <* commitM) (Right <$> a2 <* commitM)
 -- if a2 finishes first, then wait for a1
 allM :: AsyncM a -> AsyncM b -> AsyncM (a, b)
 allM a1 a2 = asyncM $ \p k -> do
-    m1 <- newEmptyMVar
-    m2 <- newEmptyMVar
+  m1 <- newEmptyMVar
+  m2 <- newEmptyMVar
 
   runM a1 p (k' m1 m2 k pair)
   runM a2 p (k' m2 m1 k $ flip pair)
@@ -141,12 +148,12 @@ allM a1 a2 = asyncM $ \p k -> do
 
     k' m1 m2 k pair = \x -> do
       b <- isEmptyMVar m2
-                                 if b then do putMVar m1 x
-                                              case x of Left e  -> k (Left e)
-                                                        Right _ -> return ()
-                                      else do y <- readMVar m2
-                                              case y of Left e  -> return ()
-                                                        Right _ -> k $ pair x y
+      if b then do putMVar m1 x
+                   case x of Left e  -> k (Left e)
+                             Right _ -> return ()
+           else do y <- readMVar m2
+                   case y of Left e  -> return ()
+                             Right _ -> k $ pair x y
 
 -- if p is not cancelled, then cancel it and return ()
 -- otherwise, do nothing (i.e. terminate)
